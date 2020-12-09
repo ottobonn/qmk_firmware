@@ -1,10 +1,9 @@
 #include QMK_KEYBOARD_H
 
-#include "../../../alt_ctrl_shared/eeprom.h"
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <math.h>
 
 enum ctrl_keycodes {
     L_BRI = SAFE_RANGE, // LED Brightness Increase
@@ -24,8 +23,250 @@ enum ctrl_keycodes {
     DBG_MTRX,           // DEBUG Toggle Matrix prints
     DBG_KBD,            // DEBUG Toggle Keyboard prints
     DBG_MOU,            // DEBUG Toggle Mouse prints
-    MD_BOOT             // Restart into bootloader after hold timeout
+    MD_BOOT,            // Restart into bootloader after hold timeout
+    LED_HUEI,
+    LED_HUED,
+    LED_SATI,
+    LED_SATD,
+    // LED_VALI,
+    // LED_VALD,
 };
+
+int pack_float_in_int(float value, float min, float max, size_t bits) {
+    float range = max - min;
+    float t = (value - min) / range;
+    int steps = (1 << bits) - 1; // e.g. 255 for 8 bits
+    return t * steps;
+}
+
+float unpack_float_from_int(int value, float min, float max, size_t bits) {
+    float range = max - min;
+    int steps = (1 << bits) - 1; // e.g. 255 for 8 bits
+    float t = (float) value / steps;
+    return min + t * range;
+}
+
+typedef union {
+  uint32_t raw;
+  struct {
+    uint8_t led_animation_id: 3,
+            led_lighting_mode: 2,
+            led_animation_breathing: 1,
+            led_enabled: 1,
+            led_animation_direction: 1;
+    uint8_t gcr_desired;
+    uint8_t hue;
+    uint8_t led_animation_speed: 3,
+            nkro: 1,
+            _unused: 4;
+  };
+} kb_config_t;
+
+kb_config_t kb_config;
+
+typedef struct {
+  float h;
+  float s;
+  float v;
+} hsv_t;
+
+typedef struct {
+  float r;
+  float g;
+  float b;
+} rgb_t;
+
+hsv_t hsv = {
+    .h = 0,
+    .s = 1,
+    .v = 1,
+};
+rgb_t rgb;
+
+#define MAX(A, B) (A > B ? A : B)
+#define MIN(A, B) (A < B ? A : B)
+
+#define HUE_STEP (1.f / 255)
+
+float clamp(float value, float min, float max) {
+  return MIN(MAX(value, min), max);
+}
+
+float fpart(float x) {
+  return x - floor(x);
+}
+
+float lerp(float a, float b, float t) {
+  return a + (b - a) * t;
+}
+
+rgb_t hsv2rgb(hsv_t hsv) {
+  rgb_t rgb = {
+    .r = hsv.v * lerp(1, clamp(fabs(fpart(hsv.h + 1) * 6 - 3) - 1, 0, 1), hsv.s),
+    .g = hsv.v * lerp(1, clamp(fabs(fpart(hsv.h + 2./3) * 6 - 3) - 1, 0, 1), hsv.s),
+    .b = hsv.v * lerp(1, clamp(fabs(fpart(hsv.h + 1./3) * 6 - 3) - 1, 0, 1), hsv.s),
+  };
+  return rgb;
+}
+
+void update_rgb(void) {
+    rgb = hsv2rgb(hsv);
+    led_instruction_t *rgb_instruction = &led_instructions[0];
+    rgb_instruction->r = rgb.r * 255;
+    rgb_instruction->g = rgb.g * 255;
+    rgb_instruction->b = rgb.b * 255;
+}
+
+void load_saved_settings(void) {
+    kb_config.raw = eeconfig_read_kb();
+
+    led_animation_id = kb_config.led_animation_id;
+    gcr_desired = kb_config.gcr_desired;
+    led_lighting_mode = kb_config.led_lighting_mode;
+    keymap_config.nkro = kb_config.nkro;
+
+    bool prev_led_animation_breathing = led_animation_breathing;
+    led_animation_breathing = kb_config.led_animation_breathing;
+    if (led_animation_breathing && !prev_led_animation_breathing) {
+        gcr_breathe = gcr_desired;
+        led_animation_breathe_cur = BREATHE_MIN_STEP;
+        breathe_dir = 1;
+    }
+
+    led_animation_direction = kb_config.led_animation_direction;
+    led_animation_speed = kb_config.led_animation_speed;
+
+    hsv.h = unpack_float_from_int(kb_config.hue, 0, 1, 8);
+    update_rgb();
+
+    bool led_enabled = kb_config.led_enabled;
+    I2C3733_Control_Set(led_enabled);
+
+#ifdef CONSOLE_ENABLE
+    uprintf("Loading saved settings from EEPROM:\n");
+    uprintf("  led_animation_id %d\n", led_animation_id);
+    uprintf("  gcr_desired %d\n", gcr_desired);
+    uprintf("  led_lighting_mode %d\n", led_lighting_mode);
+    uprintf("  nkro %d\n", keymap_config.nkro);
+    uprintf("  led_animation_breathing %d\n", led_animation_breathing);
+    uprintf("  led_animation_direction %d\n", led_animation_direction);
+    uprintf("  led_animation_speed %f\n", led_animation_speed);
+    uprintf("  led_enabled %d\n", led_enabled);
+#endif
+}
+
+void save_settings(void) {
+    // Save the keyboard config to EEPROM
+    eeconfig_update_kb(kb_config.raw);
+#ifdef CONSOLE_ENABLE
+    uprintf("Saving settings to EEPROM\n");
+#endif
+}
+
+void sync_settings(void) {
+    save_settings();
+    load_saved_settings();
+}
+
+void keyboard_post_init_kb(void) {
+#ifdef CONSOLE_ENABLE
+    uprintf("Running keyboard post-init\n");
+#endif
+    load_saved_settings();
+}
+
+void eeconfig_init_kb(void) {
+#ifdef CONSOLE_ENABLE
+    uprintf("Running eeconfig_init_kb\n");
+#endif
+    kb_config.raw = 0;
+    kb_config.led_animation_id = 0;
+    kb_config.led_lighting_mode = 0;
+    kb_config.led_animation_breathing = false;
+    kb_config.led_enabled = true;
+    kb_config.led_animation_direction = 1;
+    kb_config.gcr_desired = LED_GCR_MAX;
+    kb_config.led_animation_speed = 4;
+    kb_config.nkro = keymap_config.nkro;
+
+    save_settings();
+}
+
+void led_pattern_next(void) {
+    kb_config.led_animation_id = (kb_config.led_animation_id + 1) % led_setups_count;
+    sync_settings();
+}
+
+void led_pattern_prev(void) {
+    kb_config.led_animation_id = (kb_config.led_animation_id - 1) % led_setups_count;
+    sync_settings();
+}
+
+void led_mode_next(void) {
+    kb_config.led_lighting_mode = (kb_config.led_lighting_mode + 1) % LED_MODE_MAX_INDEX;
+    sync_settings();
+}
+
+void gcr_desired_increase(void) {
+    int brightness = kb_config.gcr_desired + LED_GCR_STEP;
+    kb_config.gcr_desired = brightness > LED_GCR_MAX ? LED_GCR_MAX : brightness;
+    sync_settings();
+}
+
+void gcr_desired_decrease(void) {
+    int brightness = kb_config.gcr_desired - LED_GCR_STEP;
+    kb_config.gcr_desired = brightness < 0 ? 0 : brightness;
+    sync_settings();
+}
+
+void led_set_enabled(bool enabled) {
+    kb_config.led_enabled = enabled;
+    sync_settings();
+}
+
+void led_set_animation_breathing(bool breathing) {
+    kb_config.led_animation_breathing = breathing;
+    sync_settings();
+}
+
+void led_animation_speed_increase(void) {
+    kb_config.led_animation_speed += 1;
+    sync_settings();
+}
+
+void led_animation_speed_decrease(void) {
+    kb_config.led_animation_speed = kb_config.led_animation_speed < 1
+        ? 0
+        : kb_config.led_animation_speed - 1;
+    sync_settings();
+}
+
+void nkro_toggle(void) {
+    kb_config.nkro = !kb_config.nkro;
+    sync_settings();
+}
+
+void led_hue_increase(void) {
+    float hue = hsv.h;
+    hue += HUE_STEP;
+    if (hue > 1) {
+        hue = 0;
+    }
+    kb_config.hue = pack_float_in_int(hue, 0, 1, 8);
+    sync_settings();
+}
+
+void led_hue_decrease(void) {
+    float hue = hsv.h;
+    hue -= HUE_STEP;
+    if (hue < 0) {
+        hue = 1;
+    }
+    kb_config.hue = pack_float_in_int(hue, 0, 1, 8);
+    sync_settings();
+}
+
+keymap_config_t keymap_config;
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [0] = LAYOUT(
@@ -41,8 +282,8 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
         _______, _______, _______, _______, _______, _______, _______, _______, _______, _______, _______, _______, _______, _______,   KC_MPLY, KC_MSTP, KC_VOLU, \
         L_T_BR,  L_PSD,   L_BRI,   L_PSI,   _______, _______, _______, _______, U_T_AGCR,_______, _______, _______, _______, _______,   KC_MPRV, KC_MNXT, KC_VOLD, \
         L_T_PTD, L_PTP,   L_BRD,   L_PTN,   _______, _______, _______, _______, _______, _______, _______, _______, _______, \
-        _______, L_T_MD,  L_OFF,   L_ON,    L_OFF,   MD_BOOT, NK_TOGG, _______, _______, _______, _______, _______,                              _______, \
-        _______, _______, _______,                   _______,                            _______, _______, _______, _______,            _______, _______, _______ \
+        _______, L_T_MD,  L_OFF,   L_ON,    L_OFF,   MD_BOOT, NK_TOGG, _______, _______, _______, _______, _______,                               _______, \
+        _______, _______, _______,                   _______,                            _______, _______, _______, _______,            LED_HUED, _______, LED_HUEI \
     ),
     /*
     [X] = LAYOUT(
@@ -62,6 +303,11 @@ void matrix_init_user(void) {
 
 // Runs constantly in the background, in a loop.
 void matrix_scan_user(void) {
+    // hsv.h = (hsv.h + 0.00001);
+    // if (hsv.h > 1) {
+    //     hsv.h = 0;
+    // }
+    // update_rgb();
 };
 
 #define MODS_SHIFT  (get_mods() & MOD_BIT(KC_LSHIFT) || get_mods() & MOD_BIT(KC_RSHIFT))
@@ -171,6 +417,34 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 nkro_toggle();
             }
             return false;
+        case LED_HUEI:
+            if (record->event.pressed) {
+                led_hue_increase();
+            }
+            return false;
+        case LED_HUED:
+            if (record->event.pressed) {
+                led_hue_decrease();
+            }
+            return false;
+        // case LED_VALI:
+        //     if (record->event.pressed) {
+        //         hsv.v += VALUE_STEP;
+        //         if (hsv.v > 1) {
+        //             hsv.v = 1;
+        //         }
+        //         update_rgb();
+        //     }
+        //     return false;
+        // case LED_VALD:
+        //     if (record->event.pressed) {
+        //         hsv.v -= VALUE_STEP;
+        //         if (hsv.v < 0) {
+        //             hsv.v = 0;
+        //         }
+        //         update_rgb();
+        //     }
+        //     return false;
         default:
             return true; //Process all other keycodes normally
     }
@@ -184,7 +458,7 @@ led_instruction_t led_instructions[] = {
     //Examples are below
 
     //All LEDs use the user's selected pattern (this is the factory default)
-     { .flags = LED_FLAG_USE_ROTATE_PATTERN },
+     { .flags = LED_FLAG_USE_RGB, .r = 0, .g = 0, .b = 0 },
 
     //Specific LEDs use the user's selected pattern while all others are off
     // { .flags = LED_FLAG_MATCH_ID | LED_FLAG_USE_ROTATE_PATTERN, .id0 = 0xFFFFFFFF, .id1 = 0xAAAAAAAA, .id2 = 0x55555555, .id3 = 0x11111111 },
